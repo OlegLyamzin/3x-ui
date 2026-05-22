@@ -1181,15 +1181,42 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 	db := database.GetDB()
 	now := time.Now().UnixMilli()
 
+	var node model.Node
+	nodeName := ""
+	if err := db.Model(model.Node{}).Where("id = ?", nodeID).First(&node).Error; err == nil {
+		nodeName = node.Name
+	}
+
+	// Transform snapshot tags to include the node name so that the same port
+	// on different nodes (or on a node vs local) never collides.
+	if nodeName != "" {
+		for _, snapIb := range snap.Inbounds {
+			if snapIb == nil {
+				continue
+			}
+			if strings.HasPrefix(snapIb.Tag, "inbound-") {
+				snapIb.Tag = fmt.Sprintf("inbound-%s-%s", nodeName, strings.TrimPrefix(snapIb.Tag, "inbound-"))
+			}
+		}
+	}
+
 	var central []model.Inbound
 	if err := db.Model(model.Inbound{}).
 		Where("node_id = ?", nodeID).
 		Find(&central).Error; err != nil {
 		return false, err
 	}
-	tagToCentral := make(map[string]*model.Inbound, len(central))
+	tagToCentral := make(map[string]*model.Inbound, len(central)*2)
 	for i := range central {
 		tagToCentral[central[i].Tag] = &central[i]
+		// Allow a transformed snapshot tag to match an existing inbound that
+		// still uses the old "inbound-<port>" format.
+		if nodeName != "" && strings.HasPrefix(central[i].Tag, "inbound-") {
+			transformed := fmt.Sprintf("inbound-%s-%s", nodeName, strings.TrimPrefix(central[i].Tag, "inbound-"))
+			if _, exists := tagToCentral[transformed]; !exists {
+				tagToCentral[transformed] = &central[i]
+			}
+		}
 	}
 
 	var centralClientStats []xray.ClientTraffic
@@ -1237,12 +1264,18 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 
 	structuralChange := false
 
-	snapTags := make(map[string]struct{}, len(snap.Inbounds))
+	snapTags := make(map[string]struct{}, len(snap.Inbounds)*2)
 	for _, snapIb := range snap.Inbounds {
 		if snapIb == nil {
 			continue
 		}
 		snapTags[snapIb.Tag] = struct{}{}
+		// Preserve any existing central inbound that still uses the old
+		// "inbound-<port>" tag format so it isn't deleted on sync.
+		if nodeName != "" && strings.HasPrefix(snapIb.Tag, "inbound-"+nodeName+"-") {
+			rawTag := "inbound-" + strings.TrimPrefix(snapIb.Tag, "inbound-"+nodeName+"-")
+			snapTags[rawTag] = struct{}{}
+		}
 
 		c, ok := tagToCentral[snapIb.Tag]
 		if !ok {
